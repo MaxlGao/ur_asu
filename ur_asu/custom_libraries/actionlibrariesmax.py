@@ -95,14 +95,14 @@ def hover_over(target_pose, height):
     fixed_roll = 0
     fixed_pitch = 180
     yaw = target_pose[1][2] # in degrees
-    # null_rot = [0, 180, 0]
+    null_rot = [0, 180, 0]
     target_rot = [fixed_roll, fixed_pitch, yaw]
-    segment_duration = 3 # specify segment_duration
+    segment_duration = 2 # specify segment_duration
     # print(block_hover, target_rot)
     (x, y, z) = target_position
     print(f"Made target pose of <{x:.3f}, {y:.3f}, {z:.3f}> @ rpy [{fixed_roll:.1f}, {fixed_pitch:.1f}, {yaw:.1f}]")
 
     return {
-        # "traj0": move(target_position,null_rot,segment_duration), # hovers over target 
-        "traj1": move(target_position,target_rot,segment_duration), # hovers over target, matching angle
+        "traj0": move(target_position,null_rot,segment_duration), # hovers over target 
+        # "traj1": move(target_position,target_rot,segment_duration), # hovers over target, matching angle
     }
