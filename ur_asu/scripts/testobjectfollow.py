@@ -154,7 +154,23 @@ class JTCClient(Node):
     def send_trajectory(self, target_pose):
         (x, y, z), (r, p, yw) = target_pose
         self.get_logger().info(f"Received pose for object {self.target_object_name}: <{x:.3f}, {y:.3f}, {z:.3f}> @ angle [{r:.1f}, {p:.1f}, {yw:.1f}]")
-        self.trajectories = hover_over(target_pose, 0.40)
+        if self.target_object_name == "allen_key":
+            # Shift over 60 mm if it's the allen key 
+            # (allen key is long and goes out of frame easily)
+            print("It's the allen key, so shifting over...")
+            rot = R.from_euler('xyz', [r, p, yw], degrees=True).as_matrix()
+            obj_pos = np.array([x, y, z])
+            point_obj_frame = np.array([0.06, 0, 0])
+            point_base_frame = rot @ point_obj_frame + obj_pos
+            target_pose = (point_base_frame, (r, p, yw))
+
+        # Instead of hovering the gripper directly over the object, backtrack a bit to center it in frame. 
+        # Since hover_over for now keeps at a constant orientation, simply bump off 50mm from the y coordinate.
+        (x, y, z), (r, p, yw) = target_pose
+        y += 0.05
+        target_pose = ([x, y, z], (r, p, yw))
+
+        self.trajectories = hover_over(target_pose, 0.30)
         self.goals = self.parse_trajectories()
         self.execute_next_trajectory()
 
