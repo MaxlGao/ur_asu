@@ -15,6 +15,10 @@ from control_msgs.msg import JointTolerance
 from ur_asu.custom_libraries.actionlibraries import move  # <-- your function here
 from ur_asu.custom_libraries.actionlibrariesmax import spin_around  # <-- your function here
 
+# Script allows for gripper positions to be sent as inputs. 
+
+GRIPPER_FINGER_OFFSET = 5.8 # mm
+
 GRIPPER_TABLE = { # Known, measured values. Gripper width in 0.1mm.
        0: 0.153,
      200: 0.150,
@@ -116,6 +120,18 @@ def canonicalize_euler(orientation):
     roll, pitch, yaw = orientation
     if abs(pitch) < 1 and abs(abs(roll) - 180) < 1:
         return (0.0, 180.0, (yaw % 360)-180)
+    else:
+        return orientation
+
+def pointspan_to_pushers(pusher_1, span, yaw_d):
+    """Provides a pair of pusher positions given pusher 1's position, span, and the angle"""
+    yaw_r = np.deg2rad(yaw_d)
+    dx = span * np.cos(yaw_r)
+    dy = span * np.sin(yaw_r)
+    new_x = pusher_1[0] + dx
+    new_y = pusher_1[1] + dy
+    pusher_2 = [new_x, new_y, 0.0]
+    return pusher_1, pusher_2
 
 def send_pushers(pusher_1_now, pusher_2_now, pusher_1_target, pusher_2_target, duration):
     """
@@ -204,10 +220,15 @@ class JTCClient(Node):
         self.trajectories = {}
         self.trajectories = append_new_traj(self.trajectories, first_move)
         
-        pusher_coordinates = [[[0.03, -0.52, 0.0], [-0.03, -0.52, 0.0]],
-                              [[0.03, -0.52, 0.0], [-0.03, -0.58, 0.0]],
-                              [[0.03, -0.52, 0.0], [+0.03, -0.58, 0.0]],
-                              [[0.03, -0.52, 0.0], [+0.03, -0.52, 0.0]]]
+        # pusher_coordinates = [[[0.03, -0.52, 0.0], [-0.03, -0.52, 0.0]],
+        #                       [[0.03, -0.52, 0.0], [-0.03, -0.58, 0.0]],
+        #                       [[0.03, -0.52, 0.0], [+0.03, -0.58, 0.0]],
+        #                       [[0.03, -0.52, 0.0], [+0.03, -0.52, 0.0]]]
+        pusher_coordinates = [[pointspan_to_pushers([0.03, -0.52, 0.0], 0.04, 0)],
+                                [pointspan_to_pushers([0.03, -0.52, 0.0], 0.10, 0)],
+                                [pointspan_to_pushers([0.03, -0.52, 0.0], 0.00, 0)],
+                                [pointspan_to_pushers([0.03, -0.52, 0.0], 0.04, 90)]]
+        
         for idx in range(len(pusher_coordinates)+1):
             if idx == 0:
                 coord = pusher_coordinates[idx]

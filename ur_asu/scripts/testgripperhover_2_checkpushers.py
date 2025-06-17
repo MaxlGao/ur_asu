@@ -15,9 +15,7 @@ from control_msgs.msg import JointTolerance
 from ur_asu.custom_libraries.actionlibraries import move  # <-- your function here
 from ur_asu.custom_libraries.actionlibrariesmax import spin_around  # <-- your function here
 
-# Script makes a list of trajectories moving the EE up and down while changing gripper width
-# as to hopefully make the gripper tips keep at a constant height. 
-# Second approach using live subscription to EE height instead of many waypoints.
+# Script moves grippers around and prints out estimated gripper positions
 
 GRIPPER_TABLE = { # Known, measured values. Gripper width in 0.1mm.
        0: 0.153,
