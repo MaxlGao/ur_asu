@@ -1,7 +1,5 @@
 import time
 import rclpy
-import numpy as np
-from scipy.spatial.transform import Rotation as R
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -9,14 +7,16 @@ from builtin_interfaces.msg import Duration
 from action_msgs.msg import GoalStatus
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from control_msgs.action import FollowJointTrajectory
-from geometry_msgs.msg import PoseStamped, PointStamped
 from control_msgs.msg import JointTolerance
+from geometry_msgs.msg import PoseStamped, PointStamped, Vector3Stamped
+from scipy.spatial.transform import Rotation as R
+from functools import partial
+import numpy as np
+import argparse
 
-from ur_asu.custom_libraries.actionlibraries import move  # <-- your function here
-from ur_asu.custom_libraries.actionlibrariesmax import spin_around  # <-- your function here
+from ur_asu.custom_libraries.actionlibrariesmax import move, hover_over
 
 # Script allows for gripper positions to be sent as inputs. 
-
 GRIPPER_FINGER_OFFSET = 0.0058 # m
 
 GRIPPER_TABLE = { # Known, measured values. Gripper width in 0.1mm.
@@ -334,6 +334,7 @@ def pointspan_to_trajectories_safer(EE_pose_now, pusher_1_target, span_target, y
     moves.extend(reversed(end_moves))
     return moves
 
+
 def append_new_traj(traj_dict, trajectory):
     # Extract the numeric suffixes from keys and find the max
     existing_keys = [key for key in traj_dict.keys() if key.startswith("traj")]
@@ -346,74 +347,91 @@ def append_new_traj(traj_dict, trajectory):
     traj_dict[new_key] = trajectory
     return traj_dict
 
+
 class JTCClient(Node):
-    def __init__(self):
-        super().__init__("trajectory_executor")
+    def __init__(self, **kwargs):
+        super().__init__("trajectory_executor", **kwargs)
+        # Parameter Management
         self.declare_parameter("controller_name", "scaled_joint_trajectory_controller")
         self.declare_parameter("joints", [
             "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
             "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"])
+        
+        # OBJECT TO FOLLOW
+        # Options: jenga_###, allen_key, wrench
+        self.declare_parameter("target", "wrench")
 
-
-        self.ee_position = np.array([-0.144, -0.435, 0.202])
-        self.ee_quat = np.array([0.0, 1.0, 0.0, 0.0])
-        self.ee_euler = np.array([0.0, 180.0, 0.0])
+        self.ee_position = []
+        self.ee_quat = []
+        self.ee_euler = []
 
         controller_name = self.get_parameter("controller_name").value + "/follow_joint_trajectory"
         self.joints = self.get_parameter("joints").value
-        
+        self.target_object_name = self.get_parameter("target").value
+        print(f"Looking for object {self.target_object_name}")
+
         self._action_client = ActionClient(self, FollowJointTrajectory, controller_name)
         self._gripper_pub = self.create_publisher(String, "/gripper_command", 10)
-        self.subscription = self.create_subscription(
+        self.object_subscription = self.create_subscription(
+            PoseStamped,
+            f"/object_poses/{self.target_object_name}",  # Listening to a specific object
+            self.object_pose_callback,
+            10)
+
+        self.ee_subscription = self.create_subscription(
             PoseStamped,
             '/tcp_pose_broadcaster/pose',
             self.ee_pose_callback,
             10)
+
+        self.recommended_topics = [
+            ('pusher_1_position', '/recommended_pusher_1/position', PointStamped),
+            ('pusher_2_position', '/recommended_pusher_2/position', PointStamped),
+            ('pusher_1_normal',   '/recommended_pusher_1/normal',   Vector3Stamped),
+            ('pusher_2_normal',   '/recommended_pusher_2/normal',   Vector3Stamped)
+        ]
+        self.recommended_subscriptions = {}
+
+        for name, topic, msg_type in self.recommended_topics:
+            callback_with_name = partial(self.push_recommend_callback, name=name)
+            sub = self.create_subscription(msg_type, topic, callback_with_name, 10)
+            self.recommended_subscriptions[name] = sub
+        self.recommend_data = {
+            "pusher_1": {"position": None, "normal": None},
+            "pusher_2": {"position": None, "normal": None},
+        }
+
         self.pusher_pub_l = self.create_publisher(PointStamped, "/gripper_pusher_left", 10)
         self.pusher_pub_r = self.create_publisher(PointStamped, "/gripper_pusher_right", 10)
+
 
         self.get_logger().info(f"Waiting for action server on {controller_name}")
         self._action_client.wait_for_server()
 
-        # Define poses
-        base_orientation = [0, 180, 0]
+        self.latest_target_pose = None
+        self.last_sent_pose = None
+        # self.pose_update_time = time.time()
 
+        # Timer to check for new poses periodically
+        self.timer = self.create_timer(1.0, self.check_for_new_pose)  # every 1s
+        
         start_duration = 3
-        self.segment_duration = 2 # 1.5 is a mite aggressive. 
+        self.segment_duration = 3 # 1.5 is a mite aggressive. 
 
-        start_position = [0.00, -0.550, GRIPPER_TABLE[0] + VERTICAL_OFFSET+0.1]
-        first_move = move(start_position, base_orientation, start_duration)
-        # start_pusher1, start_span, start_yaw = EE_pose_to_pointspan((start_position, base_orientation))
+        start_position = [0.00, -0.550, GRIPPER_TABLE[0] + VERTICAL_OFFSET]
+        start_orientation = [0, 180, 0]
+        first_move = move(start_position, start_orientation, start_duration)
         self.trajectories = {}
         self.trajectories = append_new_traj(self.trajectories, first_move)
-        
-        # pusher_coordinates = [[[0.03, -0.52, 0.0], [-0.03, -0.52, 0.0]],
-        #                       [[0.03, -0.52, 0.0], [-0.03, -0.58, 0.0]],
-        #                       [[0.03, -0.52, 0.0], [+0.03, -0.58, 0.0]],
-        #                       [[0.03, -0.52, 0.0], [+0.03, -0.52, 0.0]]]
-        self.pointspan_coordinates = [[[ 0.04, -0.50, 0.0], 0.08, 0],
-                                      [[-0.05, -0.51, 0.0], 0.08, 90],
-                                      [[-0.04, -0.60, 0.0], 0.08, 180],
-                                      [[ 0.05, -0.59, 0.0], 0.08, 270]]
-        
+
+        self.active_goal_handle = None
+        self.executing = False
+        self.last_pose_sent_time = 0
         self.goals = self.parse_trajectories()
         self.pointspan_index = 0
         self.i = 0
-        # self.send_next_pointspan()
         self.execute_next_trajectory()
 
-    def send_next_pointspan(self):
-        if self.pointspan_index >= len(self.pointspan_coordinates):
-            self.get_logger().info("Done with all pointspan trajectories")
-            raise SystemExit
-
-        coord = self.pointspan_coordinates[self.pointspan_index]
-        moves = pointspan_to_trajectories_safer([self.ee_position, self.ee_euler], coord[0], coord[1], coord[2], self.segment_duration)
-        self.pointspan_index += 1
-        for mov in moves:
-            self.trajectories = append_new_traj(self.trajectories, mov)
-        self.goals = self.parse_trajectories()
-        
 
     def ee_pose_callback(self, msg):
         # Currently publishes gripper based on subscribed z coordinate
@@ -447,6 +465,13 @@ class JTCClient(Node):
         pos_msg_r.point.x, pos_msg_r.point.y, pos_msg_r.point.z = pusher_2_pos
         self.pusher_pub_r.publish(pos_msg_r)
 
+    def push_recommend_callback(self, msg, name):
+        # Partial function, since this gets called for EVERY recommend subscriber (there are 4, and they publish one after another)
+        # self.get_logger().info(f"Received {name}: {msg}")
+        _, number, attr = name.split("_")
+        self.recommend_data[f"pusher_{number}"][attr] = msg
+
+
     def parse_trajectories(self):
         goals = {}
         for traj_name, points in self.trajectories.items():
@@ -470,13 +495,11 @@ class JTCClient(Node):
     def execute_next_trajectory(self):
         if self.i >= len(self.goals):
             self.get_logger().info("Done with current list")
-            self.send_next_pointspan()
+        else:
+            traj_name = list(self.goals)[self.i]
+            self.i += 1
 
-        traj_name = list(self.goals)[self.i]
-        self.i += 1
-
-        self.execute_trajectory(traj_name)
-
+            self.execute_trajectory(traj_name)
 
     def execute_trajectory(self, traj_name):
         self.get_logger().info(f"▶ Executing trajectory {traj_name}")
@@ -485,8 +508,102 @@ class JTCClient(Node):
         goal.goal_time_tolerance = Duration(sec=0, nanosec=500_000_000)
         goal.goal_tolerance = [JointTolerance(position=0.01, velocity=0.01, name=name) for name in self.joints]
 
+        self.executing = True  # Flag it
         self._send_goal_future = self._action_client.send_goal_async(goal)
         self._send_goal_future.add_done_callback(lambda f: self.goal_response_callback(f, traj_name))
+
+
+    def object_pose_callback(self, msg: PoseStamped):
+        # Convert quaternion to rpy
+        quat = (
+            msg.pose.orientation.x,
+            msg.pose.orientation.y,
+            msg.pose.orientation.z,
+            msg.pose.orientation.w
+        )
+        rpy = R.from_quat(quat).as_euler('xyz', degrees=True)
+        xyz = [
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z
+        ]
+        self.latest_target_pose = (xyz, rpy)
+
+    def check_for_new_pose(self):
+        if self.latest_target_pose is None:
+            return
+
+        # Only replan if we're not running something
+        if self.executing:
+            return
+
+        if self.last_sent_pose is None or self._pose_changed_enough():
+            if self.ee_euler == []:
+                print("No EE data!")
+                return
+            self.get_logger().info(f"New target detected!")
+            self.update_trajectory()
+            self.last_sent_pose = self.latest_target_pose
+
+    def _pose_changed_enough(self, lin_threshold=0.01, ang_threshold=10):
+        if self.last_sent_pose is None:
+            return True
+        old_pos, old_rot = self.last_sent_pose
+        new_pos, new_rot = self.latest_target_pose
+        lin_dist = np.linalg.norm(np.array(old_pos) - np.array(new_pos))
+        rot_dist = np.linalg.norm(np.array(old_rot) - np.array(new_rot))
+        return lin_dist > lin_threshold or rot_dist > ang_threshold
+
+    def update_trajectory(self):
+        """
+        This is a pointspan generation function that makes a list
+        of lists of trajectories, bringing the grippers safely to their target.
+        We assume that there exist actual recommended points and corresponding normal vectors. 
+        This will lift the gripper up, move it over and away from the target,
+        bring it down slowly, and then move it slowly to just touch the object.
+        """ 
+        # If any of recommended pushers are none, skip this process
+        if any([self.recommend_data["pusher_1"]["position"] is None,
+                self.recommend_data["pusher_2"]["position"] is None,
+                self.recommend_data["pusher_1"]["normal"] is None,
+                self.recommend_data["pusher_2"]["normal"] is None]):
+            print("Improper data detected. Skipping...")
+            return
+
+        # Find the EE Pose from pushers
+        # normals are normal out. We want that to be anti-camera, which is +90deg
+        # normals are also unit vector. 
+        x, y, z = [
+            self.recommend_data["pusher_1"]["normal"].vector.x,
+            self.recommend_data["pusher_1"]["normal"].vector.y,
+            self.recommend_data["pusher_1"]["normal"].vector.z
+        ]
+        normal_yaw = np.arctan2(y, x)  # radians
+        normal_yaw_d = np.degrees(normal_yaw)
+        given_yaw = normal_yaw_d - 90
+        pusher_1 = [
+            self.recommend_data["pusher_1"]["position"].point.x,
+            self.recommend_data["pusher_1"]["position"].point.y,
+            self.recommend_data["pusher_1"]["position"].point.z
+        ]
+        pusher_2 = [
+            self.recommend_data["pusher_2"]["position"].point.x,
+            self.recommend_data["pusher_2"]["position"].point.y,
+            self.recommend_data["pusher_2"]["position"].point.z
+        ]
+
+        goal_pos, goal_ori = pushers_to_EE_pose_2D(pusher_1, pusher_2, given_yaw)
+        # Then get pointspan
+        pusher_1, span, yaw = EE_pose_to_pointspan([goal_pos, goal_ori])
+
+        moves = pointspan_to_trajectories_safer([self.ee_position, self.ee_euler], 
+                                        pusher_1, span, yaw, self.segment_duration)
+        self.trajectories = {}
+        for mov in moves:
+            self.trajectories = append_new_traj(self.trajectories, mov)
+        self.i = 0 # restart
+        self.goals = self.parse_trajectories()
+        self.execute_next_trajectory()
 
     def goal_response_callback(self, future, traj_name):
         goal_handle = future.result()
@@ -502,8 +619,10 @@ class JTCClient(Node):
         status = future.result().status
         # self.get_logger().info(f"✔ Trajectory {traj_name} completed with status: {self.status_to_str(status)}")
 
+        self.executing = False  # <-- Reset flag
+
         if status == GoalStatus.STATUS_SUCCEEDED:
-            time.sleep(1)
+            time.sleep(0)
             self.execute_next_trajectory()
         else:
             raise RuntimeError("Trajectory failed: " + str(result.error_string))
@@ -522,11 +641,30 @@ class JTCClient(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = JTCClient()
+
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Run the JTCClient node with a specified target object.")
+    parser.add_argument('--target', type=str, default='allen_key', help='Name of the target object to follow')
+    parsed_args, unknown = parser.parse_known_args()
+    print(f"Recieved target: {parsed_args.target}")
+
+    # Set up parameter overrides
+    param_overrides = [
+        rclpy.parameter.Parameter(
+            "target",
+            rclpy.Parameter.Type.STRING,
+            parsed_args.target
+        )
+    ]
+
+    node = JTCClient(parameter_overrides=param_overrides)
+    # node.set_parameters(param_overrides)
+    
     try:
         rclpy.spin(node)
     except (RuntimeError, SystemExit):
         node.get_logger().info("Shutting down")
+    node.destroy_node()
     rclpy.shutdown()
 
 if __name__ == "__main__":
