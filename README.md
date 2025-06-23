@@ -62,3 +62,28 @@ To test the package:
 ```
   python3 testmove_ur5e.py
 ```
+
+## Scripts and Their Functions
+
+`testcartesian.py`: Pick and Place routine with preset locations
+
+`testgripperhover_1.py`: Defunct method to include gripper width in waypoint definitions.
+
+`testgripperhover_2_checkpushers.py`: Test script to verify calculations for gripper finger locations. 
+
+`testgripperhover_2_sendpushers.py`: Test script for defining waypoints as gripper finger locations.
+
+`testgripperhover_2.py`: Modern method of adaptively adjusting gripper width based on EE height above table.
+
+`testobjectfollow.py --target [target_name]`: EE follows user-defined object at set height above table. Connects to `max_camera_localizer`.
+
+`testobjectprepush.py`: EE sets up gripper for push, based on recommended pusher positions. Connects to `max_camera_localizer`.
+
+`testspinaround.py`: rotates the end-effector 360 degrees to verify that IK keeps all other joint angles the same.  
+
+
+## Demonstration
+
+The following video represents a culmination of capabilities from this package and `max_camera_localizer`. Using the pusher recommendation system from that package, two contour points are published over ROS2 and read by a subscriber node. These two points, representing the desired location of the gripper fingertips, are converted to exact end-effector position and orientation. As the object moves over time, these points may change and necessitate a switch. A sequence of moves is then built such that the gripper retracts before switching position (as to not collide with the object), and automatically adjusts its raise/lower rate (as to keep the gripper from colliding with the table.) 
+
+![Prepush demonstration](./media/trimmed20prepush.gif)

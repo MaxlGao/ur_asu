@@ -29,7 +29,7 @@ GRIPPER_TABLE = { # Known, measured values. Gripper width in 0.1mm.
 }
 
 # Virtual table level in mm
-VERTICAL_OFFSET = 0.01 # 0.000 = gripper tips always on table (dangerous)
+VERTICAL_OFFSET = 0.003 # 0.000 = gripper tips always on table (dangerous)
 
 def gripper_width_to_height(gripper_width):
     # Clamp input to valid range
@@ -538,7 +538,7 @@ class JTCClient(Node):
             return
 
         if self.last_sent_pose is None or self._pose_changed_enough():
-            if self.ee_euler == []:
+            if len(self.ee_euler) == 0:
                 print("No EE data!")
                 return
             self.get_logger().info(f"New target detected!")
