@@ -49,6 +49,9 @@ ros2 launch ur_robot_driver ur_control.launch.py \
   tool_rx_idle_chars:=1.5 \
   tool_tx_idle_chars:=3.5
 ```
+
+3. Start controllers, if not done already. Run `ros2 control set_controller_state scaled_joint_trajectory_controller active`
+
 ## 🔧 Testing
 
 To test the package:

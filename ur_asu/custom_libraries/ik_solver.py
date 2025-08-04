@@ -73,3 +73,37 @@ def compute_ik(position, rpy, q_guess=None, max_tries=5, dx=0.001):
 
     print(f"IK failed after {max_tries} attempts. Tried perturbing from {original_position}.")
     return None
+
+
+def compute_jacobian(joint_angles):
+    """
+    Compute the 6x6 Jacobian matrix at the given joint configuration using DH parameters.
+    Returns:
+        J: A 6x6 numpy array
+    """
+    n = len(joint_angles)
+    T = np.eye(4)
+    origins = [T[:3, 3]]
+    z_axes = [T[:3, 2]]
+
+    Ts = []  # Store intermediate transforms
+
+    # Compute transformation matrices up to each joint
+    for i in range(n):
+        theta, d, a, alpha = dh_params[i]
+        T_i = dh_transform(joint_angles[i] + theta, d, a, alpha)
+        T = T @ T_i
+        Ts.append(T.copy())
+        origins.append(T[:3, 3])
+        z_axes.append(T[:3, 2])
+
+    J = np.zeros((6, n))
+
+    o_n = origins[-1]
+    for i in range(n):
+        z = z_axes[i]
+        o_i = origins[i]
+        J[:3, i] = np.cross(z, o_n - o_i)   # Linear velocity part
+        J[3:, i] = z                        # Angular velocity part
+
+    return J
