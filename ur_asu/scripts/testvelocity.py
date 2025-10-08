@@ -20,17 +20,16 @@ class CartesianVelocityController(Node):
         vel = 0.02
         duration = 5.0
         self.velocity_sequence = [
-            (np.array([ vel,  0.0, 0.0, 0.0, 0.0, 0.0]), duration),  # +X
-            (np.array([ 0.0,  vel, 0.0, 0.0, 0.0, 0.0]), duration),  # +Y
-            (np.array([-vel,  0.0, 0.0, 0.0, 0.0, 0.0]), duration),  # -X
-            (np.array([ 0.0, -vel, 0.0, 0.0, 0.0, 0.0]), duration),  # -Y
+            (np.array([ 0.0,  vel, 0.0, 0.0, 0.0, 0.0]), duration),  # -Y
+            # (np.array([ 0.0,  vel, 0.0, 0.0, 0.0, 0.0]), duration),  # +Y
+            # (np.array([-vel,  0.0, 0.0, 0.0, 0.0, 0.0]), duration),  # -X
+            # (np.array([ 0.0, -vel, 0.0, 0.0, 0.0, 0.0]), duration),  # -Y
             (np.zeros(6), 2.0),                                  # stop 2s
         ]
         self.segment_index = 0
         self.segment_start_time = None
         self.segment_index = 0
         self.v_cartesian = np.zeros(6)  # will be updated later
-        # self.v_cartesian = self.velocity_sequence[0][0]  # initialize
 
         self.joint_vel_pub = self.create_publisher(Float64MultiArray, '/forward_velocity_controller/commands', 10)
         self.joint_state_sub = self.create_subscription(JointState, '/joint_states', self.joint_state_cb, 10)
