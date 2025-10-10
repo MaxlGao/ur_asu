@@ -1,6 +1,8 @@
 import numpy as np
 from std_msgs.msg import String
 from ur_asu.custom_libraries.gripperlibraries import height_to_gripper_width
+from ur_asu.custom_libraries.generallibraries import pose_text
+from ur_asu.custom_libraries.actionlibrariesmax import move
 
 GRIPPER_TABLE = { # Known, measured values. Gripper width in 0.1mm.
        0: 0.153,
@@ -10,6 +12,9 @@ GRIPPER_TABLE = { # Known, measured values. Gripper width in 0.1mm.
      800: 0.132,
     1000: 0.114,
 }
+
+# Measured width of each gripper finger, normal to span
+GRIPPER_FINGER_OFFSET = 0.0058 # m
 
 class GripperHandler:
     """Contains a live gripper width adjuster that widens the gripper as the ee gets close to the table. 
@@ -23,6 +28,7 @@ class GripperHandler:
         # offset = 0.000 means gripper tips always on table (dangerous)
 
     def update(self, ee_position):
+        # Set the gripper width to the planned ee position
         # Increasing the virtual floor reduces the interpreted height.
         interpreted_height = ee_position[2] - self.vertical_offset
         width = height_to_gripper_width(interpreted_height)
@@ -167,6 +173,103 @@ class GripperHandler:
 
         return pusher1_position, gripper_width, yaw_d
 
+    def pointspan_to_acts_safe(self, EE_pose_now, pusher_1_target, 
+                                        span_target, yaw_target, duration):
+        """
+        Improved with retract, raise, move, lower, and advance actions. 
+        Fortunately we only need the EE pose at the first instant. 
+        """
+        print(f"""We're currently at:
+    {pose_text(EE_pose_now)}""")
+        moves = []
+        # Part 1: Retreat. Find the yaw, and set a waypoint 1 cm backward
+        retreat_distance = 0.03
+        initial_pos, initial_ori = EE_pose_now
+        # At 0 yaw, the retreat direction is towards +90 degrees.
+        retreat_angle = initial_ori[2] + 90
+        retreat_angle_r = np.deg2rad(retreat_angle)
+        retreat_dx = retreat_distance * np.cos(retreat_angle_r)
+        retreat_dy = retreat_distance * np.sin(retreat_angle_r)
+        retreat_x = initial_pos[0] + retreat_dx
+        retreat_y = initial_pos[1] + retreat_dy
+        retreat_position = [retreat_x, retreat_y, initial_pos[2]]
+        retreat_pose = [retreat_position, initial_ori]
+        moves.append(move(retreat_position, initial_ori, duration))
+        print(f"""RETREAT:
+    {pose_text(retreat_pose)}""")
+
+        # Part 2: Raise. Move to a height of 300mm
+        raise_position = retreat_position
+        raise_position[2] = 0.3 + self.vertical_offset
+        print(raise_position)
+        initial_width = height_to_gripper_width(initial_pos[2] - self.vertical_offset) * 0.0001
+        if initial_width > 0.04:
+            intermed_height = self.gripper_width_to_height(400) + self.vertical_offset
+            intermed_position = raise_position.copy()
+            intermed_position[2] = intermed_height
+            intermed_pose = [intermed_position, initial_ori]
+            print(f"""INTERMED 1:
+    {pose_text(intermed_pose)}""")
+            moves.extend([move(intermed_position, initial_ori, duration),
+                        move(raise_position, initial_ori, 2*duration)])
+        else:
+            moves.append(move(raise_position, initial_ori, 2*duration))
+
+        raise_pose = [raise_position, initial_ori]
+        print(f"""RAISE:
+    {pose_text(raise_pose)}""")
+
+
+        # Part 5: Advance. Move above a final position. 
+        # We calculate this first, then back calculate the other steps.
+        end_pos, end_ori = self.pointspan_to_EE_pose_2D(pusher_1_target, span_target, yaw_target)
+        # For the end position we must consider the gripper width. 
+        # So, we repeat some of Part 1's retreat. 
+        advance_angle = end_ori[2] + 90
+        advance_angle_r = np.deg2rad(advance_angle)
+        end_dx = GRIPPER_FINGER_OFFSET * np.cos(advance_angle_r)
+        end_dy = GRIPPER_FINGER_OFFSET * np.sin(advance_angle_r)
+        end_x = end_pos[0] + end_dx
+        end_y = end_pos[1] + end_dy
+        end_position = [end_x, end_y, end_pos[2]]
+        end_moves = [move(end_position, end_ori, duration)] # To be reversed later
+        # We assume that the camera side is facing the object, so moving forward means approaching.
+        advance_distance = retreat_distance
+        advance_dx = advance_distance * np.cos(advance_angle_r)
+        advance_dy = advance_distance * np.sin(advance_angle_r)
+        advance_x = end_pos[0] + advance_dx
+        advance_y = end_pos[1] + advance_dy
+        advance_position = [advance_x, advance_y, end_pos[2]]
+        end_moves.append(move(advance_position, end_ori, duration))
+        
+        # Part 4: Lower. Again, reverse Part 2.
+        lower_position = advance_position
+        lower_position[2] = 0.3 + self.vertical_offset
+        print(lower_position)
+
+        end_width = height_to_gripper_width(end_pos[2] - self.vertical_offset) * 0.0001
+        if end_width > 0.04:
+            intermed_height = self.gripper_width_to_height(400) + self.vertical_offset
+            intermed_position = lower_position.copy()
+            intermed_position[2] = intermed_height
+            end_moves.extend([move(intermed_position, end_ori, duration),
+                        move(lower_position, end_ori, 2*duration)])
+        else:
+            end_moves.append(move(lower_position, end_ori, 2*duration))
+        lower_pose = [lower_position, end_ori]
+        print(f"""SLIDE:
+    {pose_text(lower_pose)}""")
+        print("INTERMED 2: (Assumed)")
+        advance_pose = [advance_position, end_ori]
+        print(f"""LOWER:
+    {pose_text(advance_pose)}""")
+        end_pose = [end_pos, end_ori]
+        print(f"""END:
+    {pose_text(end_pose)}""")
+
+        # Part 3: Translate. Simply join the two lists together
+        moves.extend(reversed(end_moves))
+        return moves
 
 # # Unconverted function
 # def pointspan_to_trajectories(EE_pose_now, pusher_1_target, span_target, yaw_target, duration):

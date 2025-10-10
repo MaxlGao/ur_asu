@@ -1,46 +1,51 @@
 from builtin_interfaces.msg import Duration
 from ur_asu.custom_libraries.ik_solver import compute_ik
+import numpy as np
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from std_msgs.msg import Float64MultiArray
 
 HOME_POSE = [0.065, -0.385, 0.481, 0, 180, 0]  # XYZRPY
 
-def make_point(joint_positions, seconds):
-    return {
-        "positions": [float(x) for x in joint_positions],  # ensures all are float
-        "velocities": [0.0] * 6,
-        "time_from_start": Duration(sec=int(seconds)),
-    }
-
 def home():
-    joint_angles = compute_ik(HOME_POSE[0:3], HOME_POSE[3:6])
-    if joint_angles is not None:
-        return [make_point(joint_angles, 4)]
-    return []
+    return move(HOME_POSE[0:3], HOME_POSE[3:6], 4)
 
 def move(position, rpy, seconds):
     if len(position) != 3:
         raise ValueError(f"Expected 3D position, got {position}")
     joint_angles = compute_ik(position, rpy)
-    # (j1, j2, j3, j4, j5, j6) = joint_angles
-    # print(f"{j1:.3f}, {j2:.3f}, {j3:.3f}, {j4:.3f}, {j5:.3f}, {j6:.3f}")
-    if joint_angles is not None:
-        return [make_point(joint_angles, seconds)]
-    return []
+    if joint_angles is None:
+        return []
+    return {
+        "type": "position",
+        "joint_angles": [float(x) for x in joint_angles],
+        "time_from_start": seconds
+    }
 
-def moveZ(position, rpy, seconds):
-    if len(position) != 3:
-        raise ValueError(f"Expected 3D position, got {position}")
-    joint_angles = compute_ik(position, rpy)
-    if joint_angles is not None:
-        return [make_point(joint_angles, seconds)]
-    return []
+def gripper_width_from_height(position, gripper):
+    adjusted_height = position[2] - gripper.vertical_offset
+    width = gripper.height_to_gripper_width(adjusted_height)
+    return gripper_width(str(width))
 
-def moveXY(position, rpy, seconds):
-    if len(position) != 3:
-        raise ValueError(f"Expected 3D position, got {position}")
-    joint_angles = compute_ik(position, rpy)
-    if joint_angles is not None:
-        return [make_point(joint_angles, seconds)]
-    return []
+def gripper_width(cmd):
+    """cmd is a string, and may be 'open', 'close', or a numerical string from 0 to 1100"""
+    return {
+        "type": "gripper",
+        "cmd": cmd
+        }
+
+def velocity(v_cartesian, seconds):
+    return {
+        "type": "velocity",
+        "velocity": v_cartesian,
+        "duration": seconds
+        }
+
+def force(f_cartesian, seconds):
+    return {
+        "type": "force",
+        "force": f_cartesian,
+        "duration": seconds
+        }
 
 def pick_and_place(block_pose, slot_pose):
     """
@@ -56,15 +61,15 @@ def pick_and_place(block_pose, slot_pose):
     segment_duration = 6 # specify segment_duration
 
     return {
-        "traj0": home(),
-        "traj1": move(block_hover,block_pose[1],segment_duration), # hovers on block 
-        "traj2": moveZ(block_pose[0],block_pose[1],segment_duration), # descends to grip position, 
-        "traj3": moveZ(block_pose[0],block_pose[1],segment_duration), # gripper close
-        "traj4": moveZ(block_hover,block_pose[1],segment_duration), # holds block and hovers 
-        "traj5": moveXY(slot_hover,slot_pose[1],segment_duration), # holds block and moves in 2D to hover on slot
-        "traj6": moveZ(slot_pose[0],slot_pose[1],segment_duration), # holds block and descends into slot,
-        "traj7": moveZ(slot_pose[0],slot_pose[1],segment_duration), # gripper open
-        "traj8": home() # homing
+        "act0": home(),
+        "act1": move(  block_hover, block_pose[1], segment_duration), # hovers on block 
+        "act2": move(block_pose[0], block_pose[1], segment_duration), # descends to grip position, 
+        "act3": move(block_pose[0], block_pose[1], segment_duration), # gripper close
+        "act4": move(  block_hover, block_pose[1], segment_duration), # holds block and hovers 
+        "act5": move(   slot_hover,  slot_pose[1], segment_duration), # holds block and moves in 2D to hover on slot
+        "act6": move( slot_pose[0],  slot_pose[1], segment_duration), # holds block and descends into slot,
+        "act7": move( slot_pose[0],  slot_pose[1], segment_duration), # gripper open
+        "act8": home() # homing
     }
 
 def spin_around(target_pose, height):
@@ -76,14 +81,14 @@ def spin_around(target_pose, height):
     yaws = range(0, 360, 45)
     segment_duration = 3 # specify segment_duration
     return {
-        "traj0": move(target_position, [0, 180, yaws[0]], segment_duration),
-        "traj1": move(target_position, [0, 180, yaws[1]], segment_duration),
-        "traj2": move(target_position, [0, 180, yaws[2]], segment_duration),
-        "traj3": move(target_position, [0, 180, yaws[3]], segment_duration),
-        "traj4": move(target_position, [0, 180, yaws[4]], segment_duration),
-        "traj5": move(target_position, [0, 180, yaws[5]], segment_duration),
-        "traj6": move(target_position, [0, 180, yaws[6]], segment_duration),
-        "traj7": move(target_position, [0, 180, yaws[7]], segment_duration),
+        "act0": move(target_position, [0, 180, yaws[0]], segment_duration),
+        "act1": move(target_position, [0, 180, yaws[1]], segment_duration),
+        "act2": move(target_position, [0, 180, yaws[2]], segment_duration),
+        "act3": move(target_position, [0, 180, yaws[3]], segment_duration),
+        "act4": move(target_position, [0, 180, yaws[4]], segment_duration),
+        "act5": move(target_position, [0, 180, yaws[5]], segment_duration),
+        "act6": move(target_position, [0, 180, yaws[6]], segment_duration),
+        "act7": move(target_position, [0, 180, yaws[7]], segment_duration),
     }
 
 def hover_over(target_pose, height):
@@ -103,6 +108,18 @@ def hover_over(target_pose, height):
     print(f"Made target pose of <{x:.3f}, {y:.3f}, {z:.3f}> @ rpy [{fixed_roll:.1f}, {fixed_pitch:.1f}, {yaw:.1f}]")
 
     return {
-        "traj0": move(target_position,null_rot,segment_duration), # hovers over target 
-        # "traj1": move(target_position,target_rot,segment_duration), # hovers over target, matching angle
+        "act0": move(target_position,null_rot,segment_duration), # hovers over target 
+        "act1": move(target_position,target_rot,segment_duration), # hovers over target, matching angle
     }
+
+def append_new_act(traj_dict, trajectory):
+    # Extract the numeric suffixes from keys and find the max
+    existing_keys = [key for key in traj_dict.keys() if key.startswith("act")]
+    if existing_keys:
+        max_index = max(int(key[3:]) for key in existing_keys if key[3:].isdigit())
+    else:
+        max_index = 0
+
+    new_key = f"act{max_index + 1}"
+    traj_dict[new_key] = trajectory
+    return traj_dict

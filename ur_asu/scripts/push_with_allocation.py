@@ -2,304 +2,252 @@ import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.action import ActionClient
-from control_msgs.action import FollowJointTrajectory
+from geometry_msgs.msg import PoseStamped
+from scipy.spatial.transform import Rotation as R
 
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from std_msgs.msg import Float64MultiArray
-from sensor_msgs.msg import JointState
-from builtin_interfaces.msg import Duration
-from geometry_msgs.msg import PoseStamped, Wrench, Twist
+from ur_asu.custom_libraries.motion_utils import MotionExecutor
+from ur_asu.custom_libraries.pusher_utils import PusherHandler
+from ur_asu.custom_libraries.gripper_utils import GripperHandler, GRIPPER_TABLE
+from ur_asu.custom_libraries.actionlibrariesmax import move, velocity, force, append_new_act
 
-from controller_manager_msgs.srv import SwitchController, ListControllers, LoadController
-from ur_msgs.srv import SetForceMode
-from std_srvs.srv import Trigger
-
-from ur_asu.custom_libraries.ik_solver import compute_ik, compute_jacobian
-
-
-class MixedCartesianController(Node):
+class OverController(Node):
     def __init__(self):
-        super().__init__('mixed_cartesian_controller')
+        super().__init__('motion_planner')
 
         self.joint_names = [
             "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
             "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"
         ]
 
-        # Controllers
+        # Controller Names
         self.position_controller = 'scaled_joint_trajectory_controller'
         self.velocity_controller = 'forward_velocity_controller'
         self.force_controller = 'force_mode_controller'
         self.passthrough_controller = 'passthrough_trajectory_controller'
 
-        # Action client for position control
-        traj_action_name = f'/{self.position_controller}/follow_joint_trajectory'
-        self.traj_client = ActionClient(self, FollowJointTrajectory, traj_action_name)
-
-        # Velocity publisher
-        self.joint_vel_pub = self.create_publisher(
-            Float64MultiArray,
-            f'/{self.velocity_controller}/commands',
-            10
-        )
-        
-        # Service clients
-        self.switch_client = self.create_client(SwitchController, '/controller_manager/switch_controller')
-        self.list_client = self.create_client(ListControllers, '/controller_manager/list_controllers')
-        self.load_client = self.create_client(LoadController, '/controller_manager/load_controller')
-
-        # Force mode clients
-        self.start_force_client = self.create_client(SetForceMode, '/force_mode_controller/start_force_mode')
-        self.stop_force_client = self.create_client(Trigger, '/force_mode_controller/stop_force_mode')
-
-        # Joint state subscription
-        self.joint_positions = None
-        self.joint_positions_map = {}
-        self.create_subscription(JointState, '/joint_states', self.joint_state_cb, 10)
-        
-        # Pre-start controllers automatically
-        self.prestart_controllers()
-
-    def list_controllers(self):
-        if not self.list_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().error("ListControllers service not available.")
-            return []
-        future = self.list_client.call_async(ListControllers.Request())
-        rclpy.spin_until_future_complete(self, future)
-        result = future.result()
-        return result.controller if result else []
-
-    def prestart_controllers(self):
-        """Ensure all required controllers are loaded and at least one is active."""
-        required = [
+        # Subclasses
+        self.pusher = PusherHandler(self)
+        self.vert_offset = 0.003
+        self.gripper = GripperHandler(self, vertical_offset = self.vert_offset)
+        self.motion = MotionExecutor(
+            self, self.joint_names,
             self.position_controller,
             self.velocity_controller,
             self.force_controller,
-            self.passthrough_controller
-        ]
-        controllers = {c.name: c.state for c in self.list_controllers()}
-        self.get_logger().info(f"Detected controllers: {controllers}")
-
-        for ctrl in required:
-            if ctrl not in controllers:
-                # Try to load missing controller
-                self.get_logger().warn(f"{ctrl} not loaded. Attempting to load...")
-                if not self.load_client.wait_for_service(timeout_sec=2.0):
-                    self.get_logger().error("LoadController service not available.")
-                    continue
-                req = LoadController.Request()
-                req.name = ctrl
-                future = self.load_client.call_async(req)
-                rclpy.spin_until_future_complete(self, future)
-                res = future.result()
-                if not res or not res.ok:
-                    self.get_logger().error(f"Failed to load {ctrl}")
-                    continue
-
-        # Start the default position controller to ensure robot can move
-        self.switch_to_controller([self.position_controller], [])
-
-    def joint_state_cb(self, msg):
-        for name, pos in zip(msg.name, msg.position):
-            self.joint_positions_map[name] = pos
-        if all(name in self.joint_positions_map for name in self.joint_names):
-            self.joint_positions = np.array([self.joint_positions_map[name] for name in self.joint_names])
-
-    def get_active_controllers(self):
-        active = {ctrl.name for ctrl in self.list_controllers() if ctrl.state == 'active'}
-        return active
-
-    def switch_to_controller(self, start_list, stop_list):
-        """Smartly switch active controllers without redundant calls."""
-        active_controllers = self.get_active_controllers()
-
-        # Filter out already active/inactive controllers
-        to_start = [c for c in start_list if c not in active_controllers]
-        to_stop = [c for c in stop_list if c in active_controllers]
-
-        if not to_start and not to_stop:
-            self.get_logger().info(
-                f"No controller switch needed. Active: {sorted(active_controllers)}"
+            self.passthrough_controller,
+            self.gripper,
+            pusher=self.pusher
             )
+        
+        # Targeting
+        # Options: jenga_###, allen_key, wrench
+        self.target_name = "allen_key"
+        print(f"Looking for object {self.target_name}")
+        self.object_subscription = self.create_subscription(
+            PoseStamped, f"/object_poses/{self.target_name}", self.object_pose_callback, 10
+            )
+        self.latest_target_pose = None
+        self.previous_target_pose = None
+        self.last_pose_time = time.time()
+        self.pose_timeout = 1.0
+
+        # Motion Planning
+        start_duration = 3
+        start_position = [0.00, -0.550, GRIPPER_TABLE[0] + self.vert_offset + 0.05]
+        start_orientation = [0, 180, 0]
+        first_move = move(start_position, start_orientation, start_duration)
+        self.acts = {}
+        self.acts = append_new_act(self.acts, first_move)
+
+        self.active_goal_handle = None
+        self.executing = False
+        self.i = 0
+        self.execute_next_act()
+
+    def execute_next_act(self):
+        if self.i >= len(self.acts):
+            self.get_logger().info("Done with current list. Waiting for more...")
+            self.executing = False
+            self.check_for_new_pose()
+            return
+            # if False: # some exit criteria
+            #     self.get_logger().info("Done with motion planning")
+            #     raise SystemExit
+        else:
+            act_name = list(self.acts)[self.i]
+            self.i += 1
+            self.execute_act(act_name)
+
+    def execute_act(self, act_name):
+        self.executing = True  # Flag it
+        act = self.acts[act_name]
+        act_type = act["type"]
+        self.get_logger().info(f"▶ Executing {act_name}: {act_type}")
+        if act_type == "position":
+            joint_angles = act["joint_angles"]
+            seconds = act["time_from_start"]
+            self.motion.send_joint_angles(joint_angles, seconds)
+        elif act_type == "velocity":
+            velocity = act["velocity"]
+            seconds = act["duration"]
+            self.motion.send_cartesian_velocity(velocity, seconds)
+        elif act_type == "force":
+            force = act["force"]
+            seconds = act["duration"]
+            self.motion.send_cartesian_force(force, seconds)
+        elif act_type == "gripper":
+            cmd = act["cmd"]
+            self.gripper.publish(cmd)
+        else:
+            raise ValueError("Invalid Act Type")
+        
+        self.executing = False
+        self.execute_next_act()
+
+    def object_pose_callback(self, msg: PoseStamped):
+        xyz = [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z]
+        quat = (msg.pose.orientation.x, msg.pose.orientation.y,
+                msg.pose.orientation.z, msg.pose.orientation.w
+        )
+        rpy = R.from_quat(quat).as_euler('xyz', degrees=True)
+        self.latest_target_pose = (xyz, rpy)
+        self.last_pose_time = time.time()
+
+    def check_for_new_pose(self):
+        if (time.time() - self.last_pose_time) > self.pose_timeout:
+            if not self.executing:
+                self.get_logger().warn("Lost target — initiating search pattern - STAND CLEAR.")
+                self.run_search_pattern()
+            return
+
+        if self.latest_target_pose is None:
+            # No pose available
+            return
+        
+        if self.previous_target_pose is None or self._pose_changed_enough():
+            if len(self.motion.ee_euler) == 0:
+                print("No EE data; cannot estimate object pose!")
+                return
+            self.get_logger().info(f"New target detected!")
+            self.update_act()
+            self.previous_target_pose = self.latest_target_pose
+
+    def _pose_changed_enough(self, lin_threshold=0.01, ang_threshold=10):
+        if self.previous_target_pose is None:
             return True
+        old_pos, old_rot = self.previous_target_pose
+        new_pos, new_rot = self.latest_target_pose
+        lin_dist = np.linalg.norm(np.array(old_pos) - np.array(new_pos))
+        rot_dist = np.linalg.norm(np.array(old_rot) - np.array(new_rot))
+        return lin_dist > lin_threshold or rot_dist > ang_threshold
 
-        self.get_logger().info(
-            f"Switching controllers -> start: {to_start or '[]'}, stop: {to_stop or '[]'}"
+    def update_act(self, segment_duration=3):
+        """
+        This is a pointspan generation function that makes a list
+        of acts, bringing the grippers safely to their target.
+        We assume that there exist actual recommended points and corresponding normal vectors. 
+        This will lift the gripper up, move it over and away from the target,
+        bring it down slowly, and then move it slowly to just touch the object.
+        """ 
+        pusher_1, pusher_2, given_yaw = self.pusher.extract_pusher_locations()
+        goal_pos, goal_ori = self.gripper.pushers_to_EE_pose_2D(pusher_1, pusher_2, given_yaw)
+        pusher_1, span, yaw = self.gripper.EE_pose_to_pointspan([goal_pos, goal_ori])
+
+        moves = self.gripper.pointspan_to_acts_safe(
+            [self.motion.ee_position, self.motion.ee_euler], 
+            pusher_1, span, yaw, segment_duration)
+        
+        push_yaw = goal_ori[2] - 90
+        push_yaw_r = np.deg2rad(push_yaw)
+        spd = 0.01
+        push_vector = [spd*np.cos(push_yaw_r), spd*np.sin(push_yaw_r), np.float64(0), np.float64(0), np.float64(0), np.float64(0)]
+        push = velocity(push_vector, 5.0)
+        moves.append(push)
+        # flush queue and start
+        self.acts = {}
+        self.i = 0 
+        for mov in moves:
+            self.acts = append_new_act(self.acts, mov)
+        self.execute_next_act()   
+
+    def run_search_pattern(self):
+        current_pos = np.array(self.motion.ee_position)
+        current_ori = np.array(self.motion.ee_euler)
+        target_pos = current_pos + np.array([0, 0, 0.15])
+        lift = move(
+            (target_pos).tolist(),
+            current_ori.tolist(),
+            4
         )
+    def run_search_pattern(self):
+        """
+        Perform a small pitch/roll 'gyration' while keeping position fixed.
+        Cancels mid-pattern if the object reappears.
+        """
+        current_pos = np.array(self.motion.ee_position)
+        target_pos = current_pos + np.array([0, 0, 0.15])
+        current_ori = np.array(self.motion.ee_euler)
+        self.get_logger().info("Starting orientation-based search pattern...")
 
-        if not self.switch_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().error("Controller switch service not available.")
-            return False
+        # Gyration parameters
+        deg = 10
+        tilt_angles = [(-deg, 0), (0, deg), (deg, 0), (0, -deg)]  # roll/pitch offsets in degrees
+        segment_duration = 2.0
 
-        req = SwitchController.Request()
-        req.activate_controllers = to_start
-        req.deactivate_controllers = to_stop
-        req.strictness = SwitchController.Request.STRICT
-        req.activate_asap = True
-        req.timeout = Duration(sec=5)
+        for roll_offset, pitch_offset in tilt_angles:
+            # Stop early if object found
+            if self.latest_target_pose is not None and (time.time() - self.last_pose_time) < 0.5:
+                self.get_logger().info("Target reacquired — cancelling search.")
+                self.execute_next_act()
+                return
 
-        future = self.switch_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future)
-        result = future.result()
+            target_ori = [
+                current_ori[0] + roll_offset,
+                current_ori[1] + pitch_offset,
+                current_ori[2]
+            ]
+            act = move(target_pos.tolist(), target_ori, segment_duration)
 
-        if not result or not result.ok:
-            self.get_logger().error(f"Controller switch failed. Tried to start={to_start}, stop={to_stop}")
-            return False
+            # Run one step synchronously
+            self._execute_single_act(act)
 
-        # Post verification
-        active_controllers_after = self.get_active_controllers()
-        self.get_logger().info(
-            f"Controller switch success. Now active: {sorted(active_controllers_after)}"
-        )
-        return True
+            # Small pause between tilts to allow sensors to update
+            rclpy.spin_once(self, timeout_sec=0.1)
 
-    def send_cartesian_position_goal(self, position, rpy_deg, seconds=3.0):
-        self.switch_to_controller([self.position_controller], [self.velocity_controller, self.force_controller, self.passthrough_controller])
-        joint_positions = compute_ik(position, rpy_deg)
-        if joint_positions is None:
-            self.get_logger().error("IK failed for position goal.")
-            return False
+        self.get_logger().info("Search pattern complete — waiting for detections.")
 
-        traj = JointTrajectory()
-        traj.joint_names = self.joint_names
-        point = JointTrajectoryPoint()
-        point.positions = joint_positions.tolist()
-        point.time_from_start = Duration(sec=int(seconds))
-        traj.points.append(point)
+    def _execute_single_act(self, act):
+        """Execute a single act immediately (non-queued)."""
+        act_type = act["type"]
+        self.executing = True
 
-        goal = FollowJointTrajectory.Goal()
-        goal.trajectory = traj
+        if act_type == "position":
+            joint_angles = act["joint_angles"]
+            seconds = act["time_from_start"]
+            self.motion.send_joint_angles(joint_angles, seconds)
+        elif act_type == "velocity":
+            velocity = act["velocity"]
+            seconds = act["duration"]
+            self.motion.send_cartesian_velocity(velocity, seconds)
+        elif act_type == "force":
+            force = act["force"]
+            seconds = act["duration"]
+            self.motion.send_cartesian_force(force, seconds)
+        elif act_type == "gripper":
+            cmd = act["cmd"]
+            self.gripper.publish(cmd)
 
-        self.traj_client.wait_for_server()
-        self.get_logger().info(f"Sending Cartesian position goal: {position}, rpy={rpy_deg}")
-        future = self.traj_client.send_goal_async(goal)
-        rclpy.spin_until_future_complete(self, future)
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().error("Position goal rejected by controller.")
-            return False
-
-        result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
-        self.get_logger().info("Position goal completed.")
-        return True
-
-    def send_cartesian_velocity(self, v_cartesian, duration):
-        self.switch_to_controller([self.velocity_controller], [self.position_controller, self.force_controller, self.passthrough_controller])
-        start_time = time.time()
-        self.get_logger().info(f"Starting velocity phase: {v_cartesian} for {duration}s")
-        while rclpy.ok() and (time.time() - start_time) < duration:
-            rclpy.spin_once(self, timeout_sec=0.01)
-            if self.joint_positions is None:
-                self.get_logger().warn("Waiting for joint state...")
-                continue
-            try:
-                J = compute_jacobian(self.joint_positions)
-                q_dot = np.linalg.pinv(J) @ v_cartesian
-            except Exception as e:
-                self.get_logger().error(f"Jacobian computation failed: {e}")
-                continue
-
-            msg = Float64MultiArray()
-            msg.data = q_dot.tolist()
-            self.joint_vel_pub.publish(msg)
-        self.stop_velocity()
-
-    def stop_velocity(self):
-        msg = Float64MultiArray()
-        msg.data = [0.0] * len(self.joint_names)
-        self.joint_vel_pub.publish(msg)
-        self.get_logger().info("Stopped velocity controller.")
-
-    def start_force_mode(self, task_frame_pose, selection_vector, wrench, vel_limits, pos_limits, damping=0.025, gain=0.5):
-        """Activate UR Force Mode through service."""
-        self.switch_to_controller([self.force_controller, self.passthrough_controller],
-                                  [self.position_controller, self.velocity_controller])
-
-        if not self.start_force_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().error("Force mode start service not available.")
-            return False
-
-        req = SetForceMode.Request()
-        req.task_frame = task_frame_pose
-        req.selection_vector_x = selection_vector[0]
-        req.selection_vector_y = selection_vector[1]
-        req.selection_vector_z = selection_vector[2]
-        req.selection_vector_rx = selection_vector[3]
-        req.selection_vector_ry = selection_vector[4]
-        req.selection_vector_rz = selection_vector[5]
-
-        req.wrench = Wrench()
-        req.wrench.force.x, req.wrench.force.y, req.wrench.force.z = wrench[0:3]
-        req.wrench.torque.x, req.wrench.torque.y, req.wrench.torque.z = wrench[3:6]
-
-        req.type = 2  # Force frame not transformed
-        req.speed_limits = Twist()
-        req.speed_limits.linear.x, req.speed_limits.linear.y, req.speed_limits.linear.z = vel_limits[0:3]
-        req.speed_limits.angular.x, req.speed_limits.angular.y, req.speed_limits.angular.z = vel_limits[3:6]
-
-        req.deviation_limits = pos_limits # Keeping it the same; don't care too much
-        req.damping_factor = damping
-        req.gain_scaling = gain
-
-        self.get_logger().info("Activating force mode...")
-        future = self.start_force_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future)
-        result = future.result()
-        if not result or not result.success:
-            self.get_logger().error(f"Failed to start force mode: {getattr(result, 'message', '')}")
-            return False
-
-        self.get_logger().info("Force mode activated.")
-        return True
-
-    def stop_force_mode(self):
-        if not self.stop_force_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().error("Force mode stop service not available.")
-            return False
-
-        future = self.stop_force_client.call_async(Trigger.Request())
-        rclpy.spin_until_future_complete(self, future)
-        result = future.result()
-        if not result or not result.success:
-            self.get_logger().error("Failed to stop force mode.")
-            return False
-
-        self.get_logger().info("Force mode stopped.")
-        return True
-
-
+        self.executing = False
 
 def main(args=None):
     rclpy.init(args=args)
-    node = MixedCartesianController()
+    node = OverController()
 
-    # Step 1: Go to a point
-    node.send_cartesian_position_goal([0.1, -0.5, 0.147], [0, 180, 0], seconds=4)
-
-    # Step 2: Cartesian drift -Y for 5s
-    v_cart = np.array([0.0, -0.02, 0.0, 0.0, 0.0, 0.0])
-    node.send_cartesian_velocity(v_cart, duration=5.0)
-
-    # Step 3: Cartesian drift +Y for 5s
-    v_cart = np.array([0.0, 0.02, 0.0, 0.0, 0.0, 0.0])
-    node.send_cartesian_velocity(v_cart, duration=5.0)
-
-    # Step 4: Apply downward force for 3s
-    task_frame = PoseStamped()
-    task_frame.header.frame_id = "base"
-    task_frame.pose.orientation.w = 1.0  # Identity rotation
-    selection_vector = [False, False, True, False, False, False]  # Only z-axis compliant
-    wrench = [0.0, 0.0, -10.0, 0.0, 0.0, 0.0]  # Push downward
-    vel_limits = [0.25, 0.25, 0.25, 0.5, 0.5, 0.5] # Velocity limits
-    pos_limits = [0.25, 0.25, 0.25, 0.5, 0.5, 0.5] # Position limits
-
-    node.start_force_mode(task_frame, selection_vector, wrench, vel_limits, pos_limits)
-    time.sleep(3.0)
-    node.stop_force_mode()
-
-    node.get_logger().info("Mixed Cartesian + Force motion complete.")
+    try:
+        rclpy.spin(node)
+    except (RuntimeError, SystemExit):
+        node.get_logger().info("Shutting down")
+    node.get_logger().info("Script complete.")
     node.destroy_node()
     rclpy.shutdown()
 

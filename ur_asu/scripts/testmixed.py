@@ -5,6 +5,8 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 
 from ur_asu.custom_libraries.motion_utils import MotionExecutor
+from ur_asu.custom_libraries.pusher_utils import PusherHandler
+from ur_asu.custom_libraries.gripper_utils import GripperHandler, GRIPPER_TABLE
 
 class MixedCartesianController(Node):
     def __init__(self):
@@ -22,11 +24,17 @@ class MixedCartesianController(Node):
         self.passthrough_controller = 'passthrough_trajectory_controller'
 
         # Aux. Motion Handler
-        self.motion = MotionExecutor(self, self.joint_names,
-                                     self.position_controller,
-                                     self.velocity_controller,
-                                     self.force_controller,
-                                     self.passthrough_controller)
+        self.pusher = PusherHandler(self)
+        self.gripper = GripperHandler(self, vertical_offset = 0.005)
+        self.motion = MotionExecutor(
+            self, self.joint_names,
+            self.position_controller,
+            self.velocity_controller,
+            self.force_controller,
+            self.passthrough_controller,
+            self.gripper,
+            pusher=self.pusher
+            )
 
 
 def main(args=None):
@@ -45,17 +53,10 @@ def main(args=None):
     node.motion.send_cartesian_velocity(v_cart, duration=5.0)
 
     # Step 4: Apply downward force for 3s
-    task_frame = PoseStamped()
-    task_frame.header.frame_id = "base"
-    task_frame.pose.orientation.w = 1.0  # Identity rotation
     selection_vector = [False, False, True, False, False, False]  # Only z-axis compliant
     wrench = [0.0, 0.0, -10.0, 0.0, 0.0, 0.0]  # Push downward
-    vel_limits = [0.25, 0.25, 0.25, 0.5, 0.5, 0.5] # Velocity limits
-    pos_limits = [0.25, 0.25, 0.25, 0.5, 0.5, 0.5] # Position limits
 
-    node.motion.start_force_mode(task_frame, selection_vector, wrench, vel_limits, pos_limits)
-    time.sleep(3.0)
-    node.motion.stop_force_mode()
+    node.motion.send_cartesian_force(wrench, 3.0, selection_vector=selection_vector)
 
     node.get_logger().info("Mixed Cartesian + Force motion complete.")
     node.destroy_node()

@@ -1,7 +1,7 @@
-def canonicalize_euler(orientation):
+def canonicalize_euler(orientation, tol=1):
     """Forces euler angles near the form (-180, 0, yaw') to take the equivalent form (0, 180, yaw)"""
     roll, pitch, yaw = orientation
-    if abs(pitch) < 1 and abs(abs(roll) - 180) < 1:
+    if abs(pitch) < tol and abs(abs(roll) - 180) < tol:
         return (0.0, 180.0, (yaw % 360)-180)
     else:
         return orientation
