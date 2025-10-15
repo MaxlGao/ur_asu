@@ -136,7 +136,7 @@ class MotionExecutor:
         self.node.get_logger().info(f"{description} completed.")
         return True
 
-    def send_cartesian_velocity(self, v_cartesian, duration):
+    def send_cartesian_velocity(self, v_cartesian: np.ndarray, duration):
         self.controller_manager.switch_to_controller(
             [self.velocity_controller], 
             [self.position_controller, self.force_controller, self.passthrough_controller]
@@ -176,6 +176,29 @@ class MotionExecutor:
         self.joint_vel_pub.publish(msg)
         self.report_velocity_command([0.0] * 3, [0.0] * 3)
 
+    def send_cartesian_velocity_trajectory(self, v_traj: list[np.ndarray], dt: float):
+        self.controller_manager.switch_to_controller(
+            [self.velocity_controller],
+            [self.position_controller, self.force_controller, self.passthrough_controller]
+        )
+        self.node.get_logger().info(f"Starting continuous velocity trajectory with {len(v_traj)} steps")
+        
+        for v_cartesian in v_traj:
+            if not rclpy.ok():
+                break
+            try:
+                J = compute_jacobian(self.joint_positions)
+                q_dot = np.linalg.pinv(J) @ v_cartesian
+                msg = Float64MultiArray()
+                msg.data = q_dot.tolist()
+                self.joint_vel_pub.publish(msg)
+                self.report_velocity_command(v_cartesian[0:3], v_cartesian[3:6])
+            except Exception as e:
+                self.node.get_logger().error(f"Jacobian computation failed: {e}")
+            time.sleep(dt)
+        
+        self.stop_cartesian_velocity()
+
     def report_velocity_command(self, lin, ang):
         twist_msg = TwistStamped()
         twist_msg.header.stamp = self.node.get_clock().now().to_msg()
@@ -184,7 +207,7 @@ class MotionExecutor:
         twist_msg.twist.angular.x, twist_msg.twist.angular.y, twist_msg.twist.angular.z = ang
         self.commanded_twist_pub.publish(twist_msg)
 
-    def send_cartesian_force(self, wrench, duration, 
+    def send_cartesian_force(self, wrench: list, duration, 
                         selection_vector = [True]*6,
                         vel_limits = [0.25, 0.25, 0.25, 0.5, 0.5, 0.5], 
                         pos_limits = [0.25, 0.25, 0.25, 0.5, 0.5, 0.5], 
@@ -248,4 +271,94 @@ class MotionExecutor:
             return False
 
         self.node.get_logger().info("Force mode stopped.")
+        return True
+    
+    def send_cartesian_force_step(self, wrench: list, duration, 
+                        selection_vector = [True]*6,
+                        vel_limits = [0.25, 0.25, 0.25, 0.5, 0.5, 0.5], 
+                        pos_limits = [0.25, 0.25, 0.25, 0.5, 0.5, 0.5], 
+                        damping=0.025, gain=0.5):
+        """Activate UR Force Mode through service."""
+        self.controller_manager.switch_to_controller([self.force_controller, self.passthrough_controller],
+                                  [self.position_controller, self.velocity_controller])
+
+        if not self.start_force_client.wait_for_service(timeout_sec=2.0):
+            self.node.get_logger().error("Force mode start service not available.")
+            return False
+
+        req = SetForceMode.Request()
+        task_frame = PoseStamped()
+        task_frame.header.frame_id = "base"
+        task_frame.pose.orientation.w = 1.0  # Identity rotation
+
+        req.task_frame = task_frame
+        req.selection_vector_x = selection_vector[0]
+        req.selection_vector_y = selection_vector[1]
+        req.selection_vector_z = selection_vector[2]
+        req.selection_vector_rx = selection_vector[3]
+        req.selection_vector_ry = selection_vector[4]
+        req.selection_vector_rz = selection_vector[5]
+
+        req.wrench = Wrench()
+        req.wrench.force.x, req.wrench.force.y, req.wrench.force.z = wrench[0:3]
+        req.wrench.torque.x, req.wrench.torque.y, req.wrench.torque.z = wrench[3:6]
+
+        req.type = 2  # Force frame not transformed
+        req.speed_limits = Twist()
+        req.speed_limits.linear.x, req.speed_limits.linear.y, req.speed_limits.linear.z = vel_limits[0:3]
+        req.speed_limits.angular.x, req.speed_limits.angular.y, req.speed_limits.angular.z = vel_limits[3:6]
+
+        req.deviation_limits = pos_limits # Keeping it the same; don't care too much
+        req.damping_factor = damping
+        req.gain_scaling = gain
+
+        future = self.start_force_client.call_async(req)
+        rclpy.spin_until_future_complete(self.node, future)
+        result = future.result()
+        if not result or not result.success:
+            self.node.get_logger().error(f"Failed to start force mode: {getattr(result, 'message', '')}")
+            return False
+
+        self.node.get_logger().info("Force mode activated.")
+        time.sleep(duration)
+        return True
+
+    def send_cartesian_force_trajectory(
+        self,
+        wrench_traj: list[list[float]],
+        dt: float,
+        selection_vector=[True]*6,
+        vel_limits=[0.25, 0.25, 0.25, 0.5, 0.5, 0.5],
+        pos_limits=[0.25, 0.25, 0.25, 0.5, 0.5, 0.5],
+        damping=0.025,
+        gain=0.5
+    ):
+        """Apply a sequence of wrenches continuously without stopping force mode between steps."""
+        self.controller_manager.switch_to_controller(
+            [self.force_controller, self.passthrough_controller],
+            [self.position_controller, self.velocity_controller]
+        )
+
+        if not self.start_force_client.wait_for_service(timeout_sec=2.0):
+            self.node.get_logger().error("Force mode start service not available.")
+            return False
+
+        self.node.get_logger().info(f"Starting continuous force trajectory with {len(wrench_traj)} steps")
+
+        # Apply the sequence
+        for wrench in wrench_traj:
+            if not rclpy.ok():
+                break
+
+            # Send the new wrench to the topic or service your force mode listens to
+            msg = Wrench()
+            msg.force.x, msg.force.y, msg.force.z = wrench[0:3]
+            msg.torque.x, msg.torque.y, msg.torque.z = wrench[3:6]
+            self.send_cartesian_force_step(wrench, dt, selection_vector=selection_vector,
+                                           vel_limits=vel_limits, pos_limits=pos_limits, damping=damping,
+                                           gain=gain)
+
+        # Stop force mode cleanly
+        self.stop_force_mode()
+        self.node.get_logger().info("Completed continuous force trajectory.")
         return True
