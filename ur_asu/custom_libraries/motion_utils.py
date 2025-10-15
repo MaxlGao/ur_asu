@@ -212,49 +212,9 @@ class MotionExecutor:
                         vel_limits = [0.25, 0.25, 0.25, 0.5, 0.5, 0.5], 
                         pos_limits = [0.25, 0.25, 0.25, 0.5, 0.5, 0.5], 
                         damping=0.025, gain=0.5):
-        """Activate UR Force Mode through service."""
-        self.controller_manager.switch_to_controller([self.force_controller, self.passthrough_controller],
-                                  [self.position_controller, self.velocity_controller])
-
-        if not self.start_force_client.wait_for_service(timeout_sec=2.0):
-            self.node.get_logger().error("Force mode start service not available.")
-            return False
-
-        req = SetForceMode.Request()
-        task_frame = PoseStamped()
-        task_frame.header.frame_id = "base"
-        task_frame.pose.orientation.w = 1.0  # Identity rotation
-
-        req.task_frame = task_frame
-        req.selection_vector_x = selection_vector[0]
-        req.selection_vector_y = selection_vector[1]
-        req.selection_vector_z = selection_vector[2]
-        req.selection_vector_rx = selection_vector[3]
-        req.selection_vector_ry = selection_vector[4]
-        req.selection_vector_rz = selection_vector[5]
-
-        req.wrench = Wrench()
-        req.wrench.force.x, req.wrench.force.y, req.wrench.force.z = wrench[0:3]
-        req.wrench.torque.x, req.wrench.torque.y, req.wrench.torque.z = wrench[3:6]
-
-        req.type = 2  # Force frame not transformed
-        req.speed_limits = Twist()
-        req.speed_limits.linear.x, req.speed_limits.linear.y, req.speed_limits.linear.z = vel_limits[0:3]
-        req.speed_limits.angular.x, req.speed_limits.angular.y, req.speed_limits.angular.z = vel_limits[3:6]
-
-        req.deviation_limits = pos_limits # Keeping it the same; don't care too much
-        req.damping_factor = damping
-        req.gain_scaling = gain
-
-        future = self.start_force_client.call_async(req)
-        rclpy.spin_until_future_complete(self.node, future)
-        result = future.result()
-        if not result or not result.success:
-            self.node.get_logger().error(f"Failed to start force mode: {getattr(result, 'message', '')}")
-            return False
-
-        self.node.get_logger().info("Force mode activated.")
-        time.sleep(duration)
+        self.send_cartesian_force_step(wrench, duration, selection_vector=selection_vector,
+                                        vel_limits=vel_limits, pos_limits=pos_limits, damping=damping,
+                                        gain=gain)
         self.stop_force_mode()
         return True
 
