@@ -1,6 +1,7 @@
 import time
 import numpy as np
 import rclpy
+import threading
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from scipy.spatial.transform import Rotation as R
@@ -24,7 +25,7 @@ class MotionExecutor:
     """Bulk container for all ROS2 motion command publishers in three forms: position, velocity, and force."""
     def __init__(self, node: Node, joint_names, 
                  position_controller, velocity_controller, force_controller, 
-                 passthrough_controller, gripper, pusher=None):
+                 passthrough_controller, gripper, pusher=None, auto_gripper=True):
         self.node = node
         self.joint_names = joint_names
         self.position_controller = position_controller
@@ -34,8 +35,8 @@ class MotionExecutor:
         self.controller_manager = ControllerManager(self.node)
         self.gripper = gripper
         self.pusher = pusher
-        self.auto_gripper = True
-        print(self.auto_gripper)
+        self.auto_gripper = auto_gripper
+        print(f"NOTICE: AUTO-GRIPPER SET TO {self.auto_gripper}.")
 
         # Action IO
         self.traj_client = ActionClient(
@@ -218,21 +219,6 @@ class MotionExecutor:
         self.stop_force_mode()
         return True
 
-    def stop_force_mode(self):
-        if not self.stop_force_client.wait_for_service(timeout_sec=2.0):
-            self.node.get_logger().error("Force mode stop service not available.")
-            return False
-
-        future = self.stop_force_client.call_async(Trigger.Request())
-        rclpy.spin_until_future_complete(self.node, future)
-        result = future.result()
-        if not result or not result.success:
-            self.node.get_logger().error("Failed to stop force mode.")
-            return False
-
-        self.node.get_logger().info("Force mode stopped.")
-        return True
-    
     def send_cartesian_force_step(self, wrench: list, duration, 
                         selection_vector = [True]*6,
                         vel_limits = [0.25, 0.25, 0.25, 0.5, 0.5, 0.5], 
@@ -281,6 +267,79 @@ class MotionExecutor:
 
         self.node.get_logger().info("Force mode activated.")
         time.sleep(duration)
+        return True
+
+
+    def send_cartesian_force_async(self, wrench, duration, selection_vector=[True]*6,
+                                vel_limits=[0.25]*3 + [0.5]*3,
+                                pos_limits=[0.25]*3 + [0.5]*3,
+                                damping=0.025, gain=0.5):
+        """Send a constant Cartesian force asynchronously, without blocking."""
+        def _apply_force():
+            self.controller_manager.switch_to_controller(
+                [self.force_controller, self.passthrough_controller],
+                [self.position_controller, self.velocity_controller]
+            )
+
+            if not self.start_force_client.wait_for_service(timeout_sec=2.0):
+                self.node.get_logger().error("Force mode start service not available.")
+                return False
+
+            req = SetForceMode.Request()
+            task_frame = PoseStamped()
+            task_frame.header.frame_id = "base"
+            task_frame.pose.orientation.w = 1.0
+
+            req.task_frame = task_frame
+            req.selection_vector_x, req.selection_vector_y, req.selection_vector_z, \
+            req.selection_vector_rx, req.selection_vector_ry, req.selection_vector_rz = selection_vector
+
+            req.wrench = Wrench()
+            req.wrench.force.x, req.wrench.force.y, req.wrench.force.z = wrench[0:3]
+            req.wrench.torque.x, req.wrench.torque.y, req.wrench.torque.z = wrench[3:6]
+
+            req.type = 2
+            req.speed_limits = Twist()
+            req.speed_limits.linear.x, req.speed_limits.linear.y, req.speed_limits.linear.z = vel_limits[0:3]
+            req.speed_limits.angular.x, req.speed_limits.angular.y, req.speed_limits.angular.z = vel_limits[3:6]
+            req.deviation_limits = pos_limits
+            req.damping_factor = damping
+            req.gain_scaling = gain
+
+            future = self.start_force_client.call_async(req)
+            rclpy.spin_until_future_complete(self.node, future)
+            result = future.result()
+            if not result or not result.success:
+                self.node.get_logger().error(f"Failed to start force mode: {getattr(result, 'message', '')}")
+                return False
+
+            self.node.get_logger().info("Force mode activated (async).")
+            # ish. idk whatever works
+            start_time = time.time()
+            while time.time() - start_time < duration:
+                rclpy.spin_once(self.node, timeout_sec=0.005)
+                time.sleep(0.01)
+            self.stop_force_mode()
+            self.node.get_logger().info("Force mode stopped (async).")
+
+        # Run in background
+        threading.Thread(target=_apply_force, daemon=True).start()
+        return True
+
+
+    def stop_force_mode(self):
+        if not self.stop_force_client.wait_for_service(timeout_sec=2.0):
+            self.node.get_logger().error("Force mode stop service not available.")
+            return False
+
+        future = self.stop_force_client.call_async(Trigger.Request())
+        rclpy.spin_until_future_complete(self.node, future)
+        result = future.result()
+        if not result or not result.success:
+            self.node.get_logger().error("Failed to stop force mode.")
+            return False
+
+        self.node.get_logger().info("Force mode stopped.")
         return True
 
     def send_cartesian_force_trajectory(

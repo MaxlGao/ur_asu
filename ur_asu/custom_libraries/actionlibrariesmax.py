@@ -40,11 +40,12 @@ def velocity(v_cartesian, seconds):
         "duration": seconds
         }
 
-def force(f_cartesian, seconds):
+def force(f_cartesian, seconds, selection_vector=[True]*6):
     return {
         "type": "force",
         "force": f_cartesian,
-        "duration": seconds
+        "duration": seconds,
+        "selection_vector": selection_vector
         }
 
 def pick_and_place(block_pose, slot_pose):

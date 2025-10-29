@@ -41,7 +41,7 @@ class OverController(Node):
         
         # Targeting
         # Options: jenga_###, allen_key, wrench
-        self.target_name = "allen_key"
+        self.target_name = "wrench"
         print(f"Looking for object {self.target_name}")
         self.object_subscription = self.create_subscription(
             PoseStamped, f"/object_poses/{self.target_name}", self.object_pose_callback, 10
@@ -159,9 +159,9 @@ class OverController(Node):
         
         push_yaw = goal_ori[2] - 90
         push_yaw_r = np.deg2rad(push_yaw)
-        spd = 0.01
-        push_vector = [spd*np.cos(push_yaw_r), spd*np.sin(push_yaw_r), np.float64(0), np.float64(0), np.float64(0), np.float64(0)]
-        push = velocity(push_vector, 5.0)
+        frce = 5
+        push_vector = [frce*np.cos(push_yaw_r), frce*np.sin(push_yaw_r), np.float64(0), np.float64(0), np.float64(0), np.float64(0)]
+        push = force(push_vector, 5.0)
         moves.append(push)
         # flush queue and start
         self.acts = {}
@@ -179,43 +179,9 @@ class OverController(Node):
             current_ori.tolist(),
             4
         )
-    def run_search_pattern(self):
-        """
-        Perform a small pitch/roll 'gyration' while keeping position fixed.
-        Cancels mid-pattern if the object reappears.
-        """
-        current_pos = np.array(self.motion.ee_position)
-        target_pos = current_pos + np.array([0, 0, 0.15])
-        current_ori = np.array(self.motion.ee_euler)
-        self.get_logger().info("Starting orientation-based search pattern...")
-
-        # Gyration parameters
-        deg = 10
-        tilt_angles = [(-deg, 0), (0, deg), (deg, 0), (0, -deg)]  # roll/pitch offsets in degrees
-        segment_duration = 2.0
-
-        for roll_offset, pitch_offset in tilt_angles:
-            # Stop early if object found
-            if self.latest_target_pose is not None and (time.time() - self.last_pose_time) < 0.5:
-                self.get_logger().info("Target reacquired — cancelling search.")
-                self.execute_next_act()
-                return
-
-            target_ori = [
-                current_ori[0] + roll_offset,
-                current_ori[1] + pitch_offset,
-                current_ori[2]
-            ]
-            act = move(target_pos.tolist(), target_ori, segment_duration)
-
-            # Run one step synchronously
-            self._execute_single_act(act)
-
-            # Small pause between tilts to allow sensors to update
-            rclpy.spin_once(self, timeout_sec=0.1)
-
+        self._execute_single_act(lift)
         self.get_logger().info("Search pattern complete — waiting for detections.")
-
+        
     def _execute_single_act(self, act):
         """Execute a single act immediately (non-queued)."""
         act_type = act["type"]
